@@ -1,0 +1,110 @@
+# =============================================================================
+# requirements.txt — RunPod Serverless deploy kit (Qwen2.5-VL-3B Arabic HTR)
+# =============================================================================
+# Pinned pip deps to reproduce the PROVEN local inference recipe on CUDA.
+# Base model: sherif1313/Arabic-English-handwritten-OCR-v3 (public, apache-2.0).
+# LoRA adapter (14MB) ships in the repo at ./adapter and is COPY'd by the
+# Dockerfile — it is NOT a pip dependency.
+#
+# Build target: RunPod builds this Dockerfile server-side on linux/amd64 with
+# CUDA-capable infra. Versions mirror the working local venv (that produced
+# correct outputs), swapped to the CUDA torch build where required.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# TORCH CUDA INSTALL METHOD — READ THIS (Dockerfile author, this is for you)
+# ─────────────────────────────────────────────────────────────────────────────
+# NO `--extra-index-url` / `--index-url` line is used here, ON PURPOSE.
+#
+# On linux/amd64 (RunPod's build platform), the DEFAULT PyPI wheel for
+# torch==2.10.0 IS the CUDA build — the cp312 manylinux_2_28_x86_64 wheel is
+# ~916 MB (a CPU-only wheel is ~200 MB), and it bundles the CUDA 12.8 runtime
+# (nvidia-cuda-runtime-cu12==12.8.90, nvidia-cudnn-cu12==9.10.x, cublas, nccl,
+# triton). So `pip install -r requirements.txt` yields a working CUDA build with
+# no index gymnastics. Keeping this file index-clean is intentional.
+#
+# HARD REQUIREMENT for the Dockerfile / build env, so the CUDA wheel is chosen:
+#   * Build/run on linux/amd64 (RunPod does; do NOT build this on Apple Silicon
+#     arm64 — the arm64 torch 2.10.0 wheel exists but is NOT CUDA, so pip would
+#     silently give you a non-CUDA build and inference would fall to CPU/fail).
+#   * Base image must provide a compatible glibc/driver. Recommended base:
+#       nvidia/cuda:12.8.2-runtime-ubuntu24.04   (Python 3.12)  ← matches cu128
+#     (Alt path: runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2404 ships torch
+#      2.9.1 preinstalled — if you use it, DROP the torch/torchvision pins below
+#      and DO NOT reinstall torch; transformers 5.13 only needs torch>=2.4. That
+#      is a documented, lower-risk deviation from exact 2.10.0 parity.)
+#
+# If — and ONLY if — pip ever resolves a CPU wheel in your build (verify with
+# `python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`
+# → must print "2.10.0" and the CUDA-tagged build), pin the CUDA index in the
+# DOCKERFILE (not here), e.g.:
+#     RUN pip install --index-url https://download.pytorch.org/whl/cu128 \
+#         torch==2.10.0 torchvision==0.25.0
+# Keep this requirements file clean of index directives either way.
+# =============================================================================
+
+# ── RunPod serverless SDK (handler contract: runpod.serverless.start({...})) ──
+runpod==1.7.9
+
+# ── PyTorch (CUDA build via default PyPI wheel on linux/amd64; see header) ────
+# 2.10.0 == proven local recipe. Default linux x86_64 wheel = CUDA 12.8 build.
+torch==2.10.0
+# Correct pair for torch 2.10.0 — torchvision 0.25.0 hard-pins `torch==2.10.0`
+# in its own metadata, so this is the exact match. Do NOT let this float to
+# 0.27.x — that would drag in a newer torch and break the pin.
+torchvision==0.25.0
+
+# ── HuggingFace stack ─────────────────────────────────────────────────────────
+# transformers 5.13.0 == proven recipe & current latest. Provides the native
+# in-tree Qwen2_5_VLForConditionalGeneration (no trust_remote_code fetch needed;
+# the recipe still passes it as a harmless no-op for parity). Verified core
+# install_requires: torch>=2.4, safetensors>=0.8.0, huggingface-hub>=1.5.0,<2.0,
+# tokenizers>=0.22.0,<=0.23.0, Pillow<=15.0,>=10.0.1, accelerate>=1.1.0,
+# numpy>=1.17, regex>=2025.10.22, pyyaml>=5.1.
+transformers==5.13.0
+# tokenizers — HARD core dependency of transformers 5.13 (range >=0.22.0,<=0.23.0),
+# PINNED here so the build is reproducible. Without this pin, pip resolves it
+# freely at build time to any release in that range, which defeats the whole
+# point of a pinned requirements file and can drift the Qwen tokenizer behavior
+# between builds. 0.23.0 = top of the allowed range, current.
+tokenizers==0.23.0
+# PEFT — loads the r=8 / alpha=16 LoRA adapter from ./adapter onto the base.
+peft==0.19.1
+# accelerate — required by transformers 5.x device/dtype plumbing (>=1.1.0).
+accelerate==1.14.0
+# huggingface_hub — used at BUILD to bake the ~7.5GB base into the image
+# (snapshot_download / `hf download`) and at runtime for offline cache resolution.
+# transformers 5.13 requires >=1.5.0,<2.0; pin latest 1.x.
+huggingface_hub==1.22.0
+# hf_transfer — OPTIONAL but recommended for the BUILD step only. Baking the
+# ~7.5 GB base must finish inside RunPod's 30-min docker-build cap; on a slow-HF
+# day the default downloader can blow that cap and fail the build (which you
+# cannot debug remotely). If you hit "Build exceeded 1800 seconds", uncomment
+# this and set HF_HUB_ENABLE_HF_TRANSFER=1 in the Dockerfile before the bake.
+# It is NOT imported by the handler and does not affect inference/parity.
+# hf_transfer==0.1.9
+
+# ── Tokenizer / weight IO backends ────────────────────────────────────────────
+# safetensors floor RAISED from the recipe's >=0.5 to >=0.8.0: transformers 5.13
+# hard-requires >=0.8.0. Pinned exact for reproducibility.
+safetensors==0.8.0
+# sentencepiece — tokenizer backend for the Qwen processor.
+sentencepiece==0.2.1
+
+# ── Image preprocessing (ImageOps/ImageFilter UnsharpMask, resize, EXIF) ─────
+# Pillow 12.3.0 == proven recipe; within transformers' Pillow<=15.0 bound.
+Pillow==12.3.0
+
+# ── qwen-vl-utils ─────────────────────────────────────────────────────────────
+# NOTE: the proven recipe does NOT import this (it uses
+# processor.apply_chat_template + manual PIL prep, not process_vision_info). It
+# is DEAD WEIGHT for this handler and pulls extra deps (av, requests, ...).
+# Kept ONLY for exact env parity with the local venv, per SPEC's dep list.
+# Safe to delete this single line if you want a leaner image — the handler will
+# not notice.
+qwen-vl-utils==0.0.14
+
+# ── numpy note (transitive; not pinned on purpose) ────────────────────────────
+# numpy is pulled in transitively by torch and transformers (>=1.17, unbounded).
+# Left unpinned to avoid fighting torch's own resolved numpy. If a future numpy
+# major (3.x) ever breaks the build, pin it HERE explicitly (e.g. numpy<3) —
+# do not add it speculatively now, as that risks conflicting with torch's wheel.
