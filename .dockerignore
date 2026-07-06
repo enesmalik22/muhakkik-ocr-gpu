@@ -1,0 +1,6 @@
+# HATformer LB image code-only: model network volume'dan gelir, image'a girmez.
+# Her şeyi yoksay, sadece COPY'lenen 2 dosyayı geri al → build context minik kalır
+# (klasörde 2GB'lık model/dataset olsa bile daemon'a onları göndermez).
+*
+!serve_8767.py
+!requirements-pod.txt
