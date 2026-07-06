@@ -1,213 +1,151 @@
-# syntax=docker/dockerfile:1
-# =============================================================================
-# RunPod Serverless — Qwen2.5-VL-3B Arabic-handwriting OCR (base + LoRA adapter)
-# =============================================================================
-# Build target: RunPod Serverless GitHub integration. RunPod clones this repo
-# and runs `docker build` on THEIR builders (the user has weak internet, so the
-# ~7.5GB base model is pulled from HF on RunPod's side, not the user's machine).
+# ─────────────────────────────────────────────────────────────────────────────
+# HATformer — RunPod Serverless LOAD-BALANCING worker
+# Serves serve_8767.py (FastAPI: POST /recognize + GET /ping + GET /health) on GPU.
 #
-# Hard requirements this Dockerfile satisfies:
-#   * Concrete CUDA base with a WORKING CUDA torch (torch 2.10.0 CUDA-12.8 wheel).
-#   * Pinned deps mirroring the proven local inference recipe.
-#   * The ~7.5GB public base model sherif1313/Arabic-English-handwritten-OCR-v3
-#     is BAKED into the image at BUILD via huggingface_hub.snapshot_download to
-#     /models/base, so cold starts never re-download it. The build FAILS LOUDLY
-#     if the expected weight/config files are not present after download.
-#   * The 14MB LoRA adapter (committed in the repo at ./adapter) is COPYed to
-#     /app/adapter and loaded onto the base at container import.
-#   * CMD runs the RunPod handler (runpod.serverless.start) via handler.py.
-#   * No secrets baked. HF token (if ever needed) is a RUNTIME env var only.
+# ⚠️ BEFORE YOU BUILD — TWO THINGS THAT SILENTLY BREAK A FIRST DEPLOY:
 #
-# GPU sizing: Qwen2.5-VL-3B fp16 = ~7.5GB weights + CUDA/cuDNN context + vision
-# activations => ~9-11GB steady state. Recommended RunPod serverless tier:
-# 24GB "L4 / A5000 / RTX 3090" (~$0.00019/s ≈ $0.68/hr) as primary, with the
-# 16GB "A4000" tier (~$0.00016/s ≈ $0.58/hr) as an availability fallback.
-# Set the endpoint GPU priority list to [24GB, then 16GB]. Image is ~12-16GB,
-# well under RunPod's 80GB image cap; container disk auto-sizes to the image.
+#   (A) .dockerignore IS MANDATORY. The build context (this folder) is ~2.1 GB:
+#       hatformer-muharaf/ (637M) + hatformer-synthetic/ (637M) + dataset/ (230M)
+#       + hatformer-10h-naskh-best/ (640M) are all here. This Dockerfile COPYs only
+#       serve_8767.py + requirements-pod.txt, but `docker build` first ships the
+#       ENTIRE context to the builder — so without .dockerignore you upload ~2.1 GB
+#       to the daemon on every build. On weak/hotspot internet + buildx this looks
+#       like a hang and wastes time. Create `.dockerignore` NEXT TO this Dockerfile
+#       with exactly:
+#           *
+#           !serve_8767.py
+#           !requirements-pod.txt
+#       (Allow-list form: ignore everything, then un-ignore only the 2 files copied.)
 #
-# NOTE: This has NOT been executed here (needs the user's paid RunPod account).
-# Treat as a first-deploy hypothesis; logging/error-handling live in handler.py.
-# handler.py and ./adapter/ MUST exist in the repo before the build — neither
-# was present when this Dockerfile was reviewed, so create them first (see the
-# "COMPANION FILES REQUIRED" note at the very bottom).
-# =============================================================================
+#   (B) THE MODEL MUST BE UPLOADED TO THE NETWORK VOLUME *BEFORE* THE FIRST REQUEST,
+#       or every worker crashes in lifespan _load() with a FileNotFoundError and the
+#       endpoint never goes healthy (you burn cold-start seconds on nothing). This
+#       image is code-only ON PURPOSE (see WHY below) — it does NOT contain weights.
+#
+# WHY CODE-ONLY (no 640MB weights baked in):
+#   The ~640MB model (hatformer-10h-naskh-best/model.safetensors = 667,903,136 B)
+#   is NOT copied into this image. Baking it would make every `docker push` a
+#   non-resumable multi-GB upload (torch+CUDA base + weights), re-pushed on every
+#   code change. Instead the model lives on a RunPod NETWORK VOLUME (mounted at
+#   /runpod-volume inside serverless workers), uploaded ONCE via the resumable S3
+#   API (`aws s3 sync`, skips already-uploaded objects on a flaky hotspot). This
+#   image stays tens-of-MB of extras only. The endpoint's env vars point
+#   serve_8767.py at the volume mount (see RUNPOD CONSOLE below).
+#
+#   Upload the model ONCE (from a good-enough connection), the 3 SERVE dirs only —
+#   do NOT upload dataset/ or the other two model variants (you'd triple the transfer):
+#     aws s3 sync ~/Downloads/HATFormer/hatformer-10h-naskh-best \
+#       s3://<VOLUME_ID>/hatformer-10h-naskh-best --region <DC> --endpoint-url https://s3api-<DC>.runpod.io/
+#     aws s3 sync ~/Downloads/HATFormer/trocr \
+#       s3://<VOLUME_ID>/trocr --region <DC> --endpoint-url https://s3api-<DC>.runpod.io/
+#     aws s3 sync ~/Downloads/HATFormer/arabic_tokenizer_clean \
+#       s3://<VOLUME_ID>/arabic_tokenizer_clean --region <DC> --endpoint-url https://s3api-<DC>.runpod.io/
+#   (S3 key: Console → Settings → S3 API Keys. model.safetensors is 667MB > the
+#    500MB single-PutObject cap → AWS CLI v2 auto-multiparts; if it errors use
+#    RunPod's upload_large_file.py helper.)
+#
+# BUILD (MUST be amd64 — RunPod GPUs are x86; you are on Apple Silicon):
+#   cd ~/Downloads/HATFormer   # build context = this folder (needs the .dockerignore above)
+#   docker buildx build --platform linux/amd64 -t <dockerhub_user>/hatformer-lb:v1 --push .
+#
+# RUNPOD CONSOLE (Serverless → New Endpoint):
+#   • Import from Docker Registry → <dockerhub_user>/hatformer-lb:v1
+#   • Endpoint Type = "Load Balancer"     ← THE toggle (not Queue)
+#   • GPU: cheapest 16GB tier (A4000 / RTX 4000 Ada) — 334M / ~3GB fp16 fits easily
+#   • Active/Min workers = 0 (scale-to-zero, $0 idle) · Max workers = 1 (test)
+#   • Idle timeout ≥ ~60s — the lane POSTs ONCE PER LINE CROP; a low idle timeout
+#     spins the worker down between lines and RELOADS the 640MB model every time
+#     (~15–40s each) → slow + burns cold-start compute. Keep it warm across a page.
+#   • Execution timeout ≥ 240s (lane timeout is 180–240s)
+#   • Expose HTTP Port = 8767   (must equal PORT below)
+#   • Attach the Network Volume you uploaded the model to (Advanced → Network Volumes).
+#     NOTE this PINS the endpoint to that volume's datacenter — pick a DC that has
+#     BOTH the S3 API and the cheap GPU.
+#   • Env vars (REQUIRED — these must match where you uploaded on the volume):
+#       PORT=8767
+#       PORT_HEALTH=8767
+#       HATFORMER_HOST_DEVICE=cuda
+#       HATFORMER_MODEL_DIR=/runpod-volume/hatformer-10h-naskh-best
+#       HATFORMER_PROCESSOR_DIR=/runpod-volume/trocr
+#       HATFORMER_TOKENIZER_FILE=/runpod-volume/arabic_tokenizer_clean/tokenizer.json
+#   • Set HATFORMER_SERVICE_URL on V2 prod = https://<ENDPOINT_ID>.api.runpod.ai
+#     (subdomain form — NOT the queue form api.runpod.ai/v2/<id>/runsync; the lane
+#      POSTs raw multipart to /recognize, which only the LB subdomain serves).
+#
+# ⚠️ AUTH — THE REAL BLOCKER for "V2 lane works UNCHANGED" (cannot be fixed in this
+#   image or in serve_8767.py; the container never sees a rejected request):
+#   The api.runpod.ai LB proxy is documented to enforce RunPod API-key auth at the
+#   edge. The V2 lane sends NO Authorization header (only Content-Type), so it will
+#   very likely get 401 BEFORE reaching this container. VERIFY EMPIRICALLY FIRST
+#   (~5 min, ~$0) after the endpoint is healthy:
+#     curl -i https://<ENDPOINT_ID>.api.runpod.ai/ping                                    # no header → 200? or 401?
+#     curl -i -H "Authorization: Bearer <KEY>" https://<ENDPOINT_ID>.api.runpod.ai/ping   # expect 200
+#   • No-auth 200 → lane works unchanged; just set HATFORMER_SERVICE_URL. Done.
+#   • No-auth 401/403 → add ONE header to the lane's /recognize POST:
+#       Authorization: Bearer <scoped RunPod key>   (scope the key to THIS endpoint;
+#       store as e.g. HATFORMER_SERVICE_TOKEN in prod .env). This is a small caller
+#       edit — it currently sets only Content-Type.
+#   • Zero-code-change fallback: the GPU POD flow in RUNPOD_TEST.md
+#     (https://<POD_ID>-8767.proxy.runpod.net needs no key) — but a Pod does NOT
+#     scale to zero (pay while running; Stop it manually).
+# ─────────────────────────────────────────────────────────────────────────────
 
-# --- Base image ---------------------------------------------------------------
-# nvidia/cuda 12.8.2 runtime on Ubuntu 24.04 (glibc 2.39 -> satisfies torch's
-# manylinux_2_28 wheel). We use the plain -runtime- (NOT -cudnn-) variant on
-# purpose: the torch 2.10.0 PyPI wheel bundles its own CUDA 12.8 runtime AND
-# cuDNN 9.10, so a base-image cuDNN would be dead weight. Verified on Docker Hub
-# (2026-07-06): 12.8.2-runtime-ubuntu24.04 exists; a 12.8.2-cudnn- variant does
-# NOT (only 12.8.1-cudnn-), which is why we do not depend on a cudnn base tag.
-# There is NO GPU during RunPod builds — nothing here compiles against CUDA, so
-# a runtime (not devel) base is sufficient and smaller.
-FROM nvidia/cuda:12.8.2-runtime-ubuntu24.04
+# CUDA torch is preinstalled in this base → only tiny extras to pip-install → small,
+# fast push on weak internet.
+#
+# VERSION NOTE (verified against the model + the working local env, 2026-07-06):
+#   • The checkpoint was saved with transformers 5.12.1 (config.json / generation_config.json).
+#   • The recipe that PROVABLY works locally uses transformers 5.13.0 + torch 2.10.0.
+#   • serve_8767.py passes VisionEncoderDecoderModel.from_pretrained(..., dtype=DTYPE):
+#     the `dtype=` kwarg only exists on transformers 5.x (it is the replacement for
+#     the old `torch_dtype=`). requirements-pod.txt pins `transformers>=4.53`, so a
+#     fresh pip WILL resolve to the newest 5.x → `dtype=` works. But `>=4.53` is a
+#     loose floor: if pip's resolver ever lands on a 4.x wheel, `dtype=` raises and
+#     every /recognize 500s. Recommend tightening the pin to `transformers>=5.12`
+#     in requirements-pod.txt so you can't silently get an incompatible major.
+#   • transformers 5.13 requires torch>=2.4, so this base (torch 2.4.0) satisfies the
+#     floor and pip will NOT try to reinstall torch. The verified combo is torch 2.10;
+#     torch 2.4 is very likely fine for a 334M VisionEncoderDecoder but is one minor
+#     you have not benchmarked — if you see garbled output vs. local, bump the base to
+#     a runpod/pytorch 2.5/2.6 tag rather than debugging blind.
+#   Confirm a live runpod/pytorch tag on Docker Hub at deploy time (tags rotate).
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
-# --- OS-level env -------------------------------------------------------------
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
+# Fail fast, unbuffered logs (startup model-load / warmup prints show up live in RunPod).
+# OFFLINE flags are safe here: serve_8767.py loads everything with local_files_only=True,
+# so these only PREVENT an accidental silent Hugging Face fetch (which would hang the
+# cold start and could cost time) — they never block the local volume load.
+ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-
-# --- System packages ----------------------------------------------------------
-# python3.12 is Ubuntu 24.04's default (transformers 5.13 needs >=3.10; torch
-# 2.10 ships cp312 wheels). python3-venv gives us a clean, PEP-668-free venv so
-# pip installs are isolated from the distro's "externally managed" system Python
-# (more robust than setting PIP_BREAK_SYSTEM_PACKAGES and installing into the
-# distro site-packages). libgl1/libglib2.0-0 satisfy Pillow/torchvision image
-# ops. ca-certificates is required for the HF download to verify TLS at build.
-# Merged into one layer + apt lists cleaned to keep the image lean.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.12 \
-        python3.12-venv \
-        python3-pip \
-        libgl1 \
-        libglib2.0-0 \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# --- Isolated virtualenv ------------------------------------------------------
-# Build a venv at /opt/venv and put it first on PATH. Everything below ("python",
-# "pip") then resolves to the venv interpreter — no PEP-668 friction, no reliance
-# on distro symlinks, and the same interpreter runs the build-time bake step and
-# the runtime handler. This avoids the Ubuntu-24.04 "externally managed" trap
-# entirely (no PIP_BREAK_SYSTEM_PACKAGES hack needed).
-RUN python3.12 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:${PATH}" \
-    VIRTUAL_ENV="/opt/venv"
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
 
 WORKDIR /app
 
-# --- Python deps: torch first (its own layer for cache friendliness) ----------
-# torch 2.10.0 + torchvision 0.25.0: the DEFAULT PyPI linux x86_64 wheels are
-# the CUDA 12.8 build (bundling nvidia-cuda-runtime-cu12 12.8.90 + cudnn 9.10),
-# so NO --index-url is needed and we get a working CUDA torch on RunPod's amd64
-# builders. We assert below that the wheel is the CUDA build (not a CPU fallback)
-# so a silent CPU-wheel resolution can never ship a GPU-broken image. Pinned to
-# match the proven local recipe (torch 2.10.0/tv 0.25.0). Kept in a separate RUN
-# so the ~1GB torch layer is cached across rebuilds when lighter deps/app code
-# below change.
-RUN python -m pip install --upgrade pip \
-    && python -m pip install \
-        "torch==2.10.0" \
-        "torchvision==0.25.0" \
-    && python -c "import torch, sys; \
-print('[torch] version:', torch.__version__, 'cuda build:', torch.version.cuda, flush=True); \
-sys.exit(0 if (torch.version.cuda is not None) else 'FATAL: CPU-only torch wheel resolved; expected a CUDA build (torch.version.cuda is None).')"
+# Extras only — torch already present in the base image (do NOT reinstall torch here;
+# a plain `pip install torch` would pull the CPU wheel from PyPI and lose CUDA).
+# requirements-pod.txt already omits torch and includes python-multipart (REQUIRED —
+# without it FastAPI's UploadFile/Form parsing on /recognize 500s at import/first call).
+COPY requirements-pod.txt .
+RUN pip install --no-cache-dir -r requirements-pod.txt
 
-# --- Python deps: transformers stack + HF downloader --------------------------
-# Pinned to the proven-working local venv versions. Deviations from the recipe,
-# forced by transformers 5.13 (all recorded in the deploy notes):
-#   * safetensors floor raised >=0.5 -> >=0.8.0 (transformers 5.13 requires it).
-#   * qwen-vl-utils is INCLUDED for recipe parity but is NOT imported by the
-#     handler (the proven recipe uses apply_chat_template + manual PIL prep, not
-#     process_vision_info). It is harmless; drop it later to trim the image.
-# huggingface_hub is pinned to the transformers-5.13-compatible >=1.5,<2 range
-# and provides snapshot_download used in the bake step below. hf_transfer is
-# added to speed the ~7.5GB pull so we stay well inside RunPod's 30-min
-# docker-build cap (enabled via HF_HUB_ENABLE_HF_TRANSFER in the bake step).
-RUN python -m pip install \
-        "transformers==5.13.0" \
-        "peft==0.19.1" \
-        "accelerate==1.14.0" \
-        "qwen-vl-utils==0.0.14" \
-        "pillow==12.3.0" \
-        "safetensors>=0.8.0" \
-        "sentencepiece>=0.2" \
-        "huggingface_hub>=1.5.0,<2.0" \
-        "hf_transfer>=0.1.6" \
-        "runpod>=1.7.6"
+# App code only. Model/processor/tokenizer come from the mounted network volume at
+# runtime via the HATFORMER_*_DIR env vars — nothing model-sized is copied in.
+COPY serve_8767.py .
 
-# --- Bake the base model into the image (BUILD time, on RunPod's builders) -----
-# Pull the PUBLIC, non-gated base model (~7.5GB, 2 safetensors shards) to a fixed
-# dir /models/base. This runs on RunPod's side with good bandwidth; the user's
-# weak internet is never involved. No HF token needed (public repo). We exclude
-# ONLY the sample images under assets/ (and .gitattributes) — we deliberately do
-# NOT use broad *.png/*.jpg ignore globs at the repo root, because a legitimate
-# model asset must never be skipped by an over-broad pattern. HF_HUB_OFFLINE is
-# intentionally NOT set yet (the bake needs the network); it is enabled AFTER
-# this layer.
+# Document the intended port (RunPod actually routes via the injected PORT env var).
+EXPOSE 8767
+
+# RunPod injects PORT (and PORT_HEALTH). Bind uvicorn to $PORT via SHELL-FORM CMD so
+# ${PORT} expands — an exec-form CMD would pass the literal string "${PORT}". Falls
+# back to 8767 for local `docker run`. serve_8767.py has no __main__/uvicorn.run, so
+# this CMD is the only launcher (correct for LB).
 #
-# HARD VALIDATION: after download we assert that config.json AND at least one
-# *.safetensors shard AND a tokenizer/processor config are present. If the repo
-# layout ever drifts (or an over-broad ignore pattern nukes a needed file), the
-# BUILD fails HERE — loudly, on RunPod's builder — instead of shipping an image
-# that crashes at cold start with a cryptic from_pretrained error.
-#
-# IMPORTANT build-time budget: RunPod's GitHub `docker build` step must finish
-# within 30 MINUTES ("Build exceeded maximum time limit of 1800 seconds"). A
-# ~7.5GB HF pull with hf_transfer is comfortably within that; if HF is slow and
-# the build times out, the documented fallback is to pre-build locally and push
-# to a registry (harder given weak internet) — retrying the RunPod build usually
-# succeeds. Kept as its own cached layer so app-code edits below don't re-pull.
-ENV BASE_MODEL_REPO="sherif1313/Arabic-English-handwritten-OCR-v3" \
-    BASE_MODEL_DIR="/models/base" \
-    HF_HUB_ENABLE_HF_TRANSFER=1
-RUN python -c "\
-import os, sys, glob; \
-from huggingface_hub import snapshot_download; \
-repo=os.environ['BASE_MODEL_REPO']; dst=os.environ['BASE_MODEL_DIR']; \
-print(f'[bake] snapshot_download {repo} -> {dst}', flush=True); \
-p=snapshot_download(repo_id=repo, local_dir=dst, \
-    ignore_patterns=['assets/*', '.gitattributes'], \
-    max_workers=8); \
-files=sorted(os.listdir(dst)); \
-print('[bake] contents:', files, flush=True); \
-has_weights=bool(glob.glob(os.path.join(dst, '*.safetensors'))); \
-has_config=os.path.exists(os.path.join(dst, 'config.json')); \
-has_proc=any(os.path.exists(os.path.join(dst, f)) for f in ('preprocessor_config.json','processor_config.json')); \
-has_tok=any(os.path.exists(os.path.join(dst, f)) for f in ('tokenizer.json','tokenizer_config.json')); \
-missing=[n for n,ok in (('*.safetensors',has_weights),('config.json',has_config),('processor_config',has_proc),('tokenizer',has_tok)) if not ok]; \
-sys.exit(0 if not missing else f'FATAL: baked model at {dst} is missing required files: {missing}. Contents were: {files}')"
-
-# --- Runtime env: force fully-offline model loading ---------------------------
-# The base is baked at /models/base and the adapter is COPYed below; the handler
-# must NEVER hit the network at cold start. HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE
-# guarantee that (with local_files_only=True in the handler as belt-and-braces).
-# HF_HOME points the cache into the image dir for determinism. handler.py reads
-# BASE_MODEL_DIR / ADAPTER_DIR from the env below and must load the base from
-# the LOCAL PATH BASE_MODEL_DIR (NOT the HF repo id) so offline loading works.
-# hf_transfer stays enabled but is a no-op offline.
-ENV HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1 \
-    HF_HOME="/models/hf-home" \
-    ADAPTER_DIR="/app/adapter" \
-    TOKENIZERS_PARALLELISM=false
-
-# --- App code: adapter + handler (last, so edits don't bust heavier layers) ---
-# The 14MB LoRA adapter is committed in the repo at ./adapter. COPY it verbatim;
-# handler.py must load it with PeftModel.from_pretrained(model, ADAPTER_DIR)
-# (i.e. read ADAPTER_DIR from the env — do NOT hardcode a relative "./adapter",
-# which would resolve against the process CWD and is fragile).
-COPY adapter/ /app/adapter/
-# The RunPod handler. Loads processor + base (from BASE_MODEL_DIR) + adapter ONCE
-# at module import (cold start) and reuses them across invocations. It must:
-#   - read BASE_MODEL_DIR / ADAPTER_DIR from os.environ,
-#   - load base + adapter with local_files_only=True, dtype=torch.float16,
-#     re-tie weights, .to("cuda"), .eval() (per the proven recipe),
-#   - loop per-image over the ordered line-crops in job["input"], returning
-#     texts 1:1 in the same order,
-#   - wrap each single image in try/except so ONE bad crop cannot crash the whole
-#     page (return an error marker for that index, keep going),
-#   - end with runpod.serverless.start({"handler": handler}).
-COPY handler.py /app/handler.py
-
-# --- Entrypoint ---------------------------------------------------------------
-# `-u` = unbuffered stdout/stderr so every print()/traceback shows up in RunPod
-# logs immediately (critical for diagnosing a first deploy). handler.py ends with
-# runpod.serverless.start({"handler": handler}); no HTTP server of our own — this
-# is a QUEUE-type endpoint, so RunPod owns the server loop. Absolute path is used
-# so the CMD is independent of WORKDIR.
-CMD ["python", "-u", "/app/handler.py"]
-
-# =============================================================================
-# COMPANION FILES REQUIRED (not created by this review — build WILL fail without
-# them, since COPY lines above reference both):
-#   * ./adapter/            — the 14MB PEFT LoRA (adapter_config.json +
-#                             adapter_model.safetensors), committed into the repo.
-#   * ./handler.py          — the RunPod handler implementing the proven recipe,
-#                             reading BASE_MODEL_DIR / ADAPTER_DIR from env and
-#                             ending in runpod.serverless.start({"handler":...}).
-# Also ensure a .dockerignore does NOT exclude ./adapter or ./handler.py.
-# =============================================================================
+# HEALTH: serve_8767.py already exposes GET /ping (LB polls this, not /health). The
+# model loads in the FastAPI lifespan BEFORE uvicorn accepts traffic, so by the time
+# /ping can answer, the model is loaded → it returns 200. (Its not-ready branch
+# returns 503; RunPod's LB treats 200=healthy / 204=initializing / else=unhealthy, so
+# 503 reads as "unhealthy" rather than "still loading". This is fine as long as model
+# load stays inside lifespan — the 503 branch is unreachable in normal operation. If
+# you ever move load out of lifespan, change that 503 → 204 in serve_8767.py.)
+CMD ["sh", "-c", "uvicorn serve_8767:app --host 0.0.0.0 --port ${PORT:-8767}"]
