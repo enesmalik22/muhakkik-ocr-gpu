@@ -1,0 +1,13 @@
+# RunPod POD — HATformer /recognize servisi için Python bağımlılıkları.
+# NOT: RunPod "PyTorch" template'inde torch+CUDA ZATEN kurulu → torch'u tekrar KURMA.
+# Sadece şunları kur:  pip install -r requirements-pod.txt
+# transformers 5.x ŞART: serve VisionEncoderDecoderModel.from_pretrained(dtype=...)
+# kullanıyor; dtype= sadece 5.x'te var. 4.x'e düşerse her /recognize 500 verir.
+# Checkpoint 5.12.1 ile kaydedildi, çalışan reçete 5.13.0 → 5.13'e sabitle.
+transformers>=5.13,<6
+peft>=0.16
+accelerate>=1.1
+fastapi>=0.110
+uvicorn>=0.29
+pillow>=10
+python-multipart>=0.0.9
